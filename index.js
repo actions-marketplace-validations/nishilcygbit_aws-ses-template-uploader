@@ -1,73 +1,97 @@
-const core = require('@actions/core');
-const { 
-    SESClient,
-    UpdateTemplateCommand,
-    CreateTemplateCommand,
-    GetTemplateCommand
-} = require('@aws-sdk/client-ses');
-const fs = require('fs');
+const core = require("@actions/core");
+const {
+  SESClient,
+  UpdateTemplateCommand,
+  CreateTemplateCommand,
+  GetTemplateCommand,
+} = require("@aws-sdk/client-ses");
+const fs = require("fs");
 
 async function run() {
-    try {
-        // Grab the templates directory location from the input
-        const templatesDir = core.getInput('templates');
+  try {
+    // Grab the templates directory location from the input
+    const templatesDir = core.getInput("templates");
 
-        // Grab the prefix from the input
-        const prefix = core.getInput('prefix');
+    // Grab the prefix from the input
+    const prefix = core.getInput("prefix");
 
-        // GitHub should validate this because it's required, but just to be safe!
-        if (!templatesDir) {
-            core.setFailed('no templates directory provided');
-            return;
-        }
-
-        // Create a new SES Client, taking credentials from aws-actions/configure-aws-credentials
-        const client = new SESClient();
-
-        // Parse each file in the directory
-        parseFiles(client, templatesDir, prefix);
-    } catch (error) {
-        core.setFailed(error.message);
+    // GitHub should validate this because it's required, but just to be safe!
+    if (!templatesDir) {
+      core.setFailed("no templates directory provided");
+      return;
     }
+
+    // Create a new SES Client, taking credentials from aws-actions/configure-aws-credentials
+    const client = new SESClient();
+
+    // Parse each file in the directory
+    await parseFiles(client, templatesDir, prefix);
+  } catch (error) {
+    core.setFailed(error.message);
+  }
 }
 
-function parseFiles(client, templatesDir, prefix) {
-    // Read each file in the directory
-    fs.readdirSync(templatesDir).forEach((name) => {
-        const path = `${templatesDir}/${name}`;
+async function parseFiles(client, templatesDir, prefix) {
+  const allFiles = fs.readdirSync(templatesDir);
+  core.notice(`Found ${allFiles.length} files in the directory`);
 
-        // If it's a directory, read the file within there
-        if (fs.lstatSync(path).isDirectory()) {
-            readFiles(path);
-            return;
+  const filesChunks = [];
+  for (let i = 0; i < allFiles.length; i += 20) {
+    filesChunks.push(allFiles.slice(i, i + 20));
+  }
+  core.notice(`Split the files into ${filesChunks.length} chunks`);
+
+  for (const fileChunk of filesChunks) {
+    core.notice(`Processing the next batch of files - ${fileChunk.length}`);
+
+    for (const name of fileChunk) {
+      // Use for...of for async/await inside loop
+      const path = `${templatesDir}/${name}`;
+      core.notice(`Processing file - ${path}`);
+
+      if (fs.lstatSync(path).isDirectory()) {
+        readFiles(path);
+        continue; // Use continue to skip to the next file
+      }
+
+      const file = JSON.parse(fs.readFileSync(path));
+      const templateName = `${prefix}${file.Template.TemplateName}`;
+
+      try {
+        await client.send(
+          new GetTemplateCommand({ TemplateName: templateName })
+        );
+        // Template exists, update it
+        try {
+          await client.send(
+            new UpdateTemplateCommand({
+              Template: { ...file.Template, TemplateName: templateName },
+            })
+          );
+          core.notice(`Updated template: ${templateName} (${name})`);
+        } catch (error) {
+          core.setFailed(error.message);
         }
+      } catch (error) {
+        // Catch the GetTemplateCommand error
+        // Template doesn't exist, create it
+        try {
+          await client.send(
+            new CreateTemplateCommand({
+              Template: { ...file.Template, TemplateName: templateName },
+            })
+          );
+          core.notice(`Created template: ${templateName} (${name})`);
+        } catch (createError) {
+          core.setFailed(createError.message);
+        }
+      }
+      core.notice(`Finished Processing file - ${path}`);
 
-        // Parse the JSON from the file
-        const file = JSON.parse(fs.readFileSync(path));
-
-        const templateName = `${prefix}${file.Template.TemplateName}`;
-
-        // First, figure out if we have a template
-        client.send(new GetTemplateCommand({TemplateName: templateName})).then(() => {
-            // We have a template! Update it
-
-            client.send(new UpdateTemplateCommand({
-                Template: { ...file.Template, TemplateName: templateName }
-            })).then(() => {
-                core.notice(`Updated template: ${templateName} (${name})`);
-            }).catch((error) => {
-                core.setFailed(error.message);
-            });
-        }).catch(() => {
-            client.send(new CreateTemplateCommand({
-                Template: { ...file.Template, TemplateName: templateName }
-            })).then(() => {
-                core.notice(`Created template: ${templateName} (${name})`);
-            }).catch((error) => {
-                core.setFailed(error.message);
-            });
-        })
-    });
+      core.notice("Waiting for 1 second before processing the next file");
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+  }
 }
 
 run();
